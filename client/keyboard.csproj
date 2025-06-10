@@ -1,0 +1,21 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net9.0-windows10.0.26100.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+    <OutputType>WinExe</OutputType>
+    <SupportedOSPlatformVersion>10.0.26100.0</SupportedOSPlatformVersion>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Kawazu" Version="1.1.4" />
+    <PackageReference Include="LibNMeCab" Version="0.10.2" />
+    <PackageReference Include="LibNMeCab.IpaDicBin" Version="0.10.0" />
+    <PackageReference Include="NMeCab" Version="0.6.4" />
+    <PackageReference Include="System.IO.Ports" Version="9.0.5" />
+    <PackageReference Include="System.Management" Version="9.0.5" />
+  </ItemGroup>
+
+</Project>
