@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.ComponentModel;
@@ -175,7 +175,7 @@ namespace KeymapperGui
         private async void MainWindow_Loaded(object sender, RoutedEventArgs e)
         {
             _mediaManager = await GlobalSystemMediaTransportControlsSessionManager.RequestAsync();
-            _mediaTimer.Interval = TimeSpan.FromMilliseconds(500);
+            _mediaTimer.Interval = TimeSpan.FromMilliseconds(100);
             _mediaTimer.Tick += async (_, __) => await CheckAndSendMediaInfo();
             _mediaTimer.Start();
         }
