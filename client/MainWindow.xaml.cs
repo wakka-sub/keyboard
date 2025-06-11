@@ -15,7 +15,7 @@ using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Threading;
-using Windows.Media.Control;           // Media Session API
+using Windows.Media.Control;    // Media Session API
 using Kawazu;
 
 namespace KeymapperGui
@@ -140,9 +140,8 @@ namespace KeymapperGui
         private readonly DispatcherTimer _mediaTimer = new DispatcherTimer();
         private KawazuConverter converter = new KawazuConverter();
 
-        // --- ADDED: Fields for acknowledgment timeout ---
         private TaskCompletionSource<bool> _songInfoAckTcs;
-        private readonly object _ackLock = new object(); // Lock object for thread-safe access to TCS
+        private readonly object _ackLock = new object();
 
         public ObservableCollection<KeyMappingViewModel> KeyMappings { get; set; } = new ObservableCollection<KeyMappingViewModel>();
 
@@ -175,81 +174,93 @@ namespace KeymapperGui
         private async void MainWindow_Loaded(object sender, RoutedEventArgs e)
         {
             _mediaManager = await GlobalSystemMediaTransportControlsSessionManager.RequestAsync();
-            _mediaTimer.Interval = TimeSpan.FromMilliseconds(100);
+            _mediaTimer.Interval = TimeSpan.FromMilliseconds(500); // ★ MODIFIED: ポーリング間隔を少し長くして負荷を軽減
             _mediaTimer.Tick += async (_, __) => await CheckAndSendMediaInfo();
             _mediaTimer.Start();
         }
 
-        // --- CHANGED: Entire method updated for timeout logic ---
+        // ★★★ MODIFIED: この関数全体を再生時間情報取得・送信ロジックに対応 ★★★
         private async Task CheckAndSendMediaInfo()
         {
-            // Do nothing if already awaiting acknowledgment for a previous song info
             if (_songInfoAckTcs != null) return;
 
             TaskCompletionSource<bool> tcs = null;
             try
             {
+                string songInfoPayload;
                 var session = _mediaManager.GetSessions()
                     .FirstOrDefault(s => s.GetPlaybackInfo().PlaybackStatus != GlobalSystemMediaTransportControlsSessionPlaybackStatus.Closed);
-                if (session == null) return;
 
-                var props = await session.TryGetMediaPropertiesAsync();
-                string title = props.Title ?? "";
+                if (session == null)
+                {
+                    // No active media session
+                    songInfoPayload = "Waiting for the beat...,0,0,0";
+                }
+                else
+                {
+                    var props = await session.TryGetMediaPropertiesAsync();
+                    string title = props.Title;
+                    if (string.IsNullOrWhiteSpace(title))
+                    {
+                        title = "Waiting for the beat...";
+                    }
 
-                string status = session.GetPlaybackInfo().PlaybackStatus == GlobalSystemMediaTransportControlsSessionPlaybackStatus.Playing
-                                ? "1" : "0";
+                    // 再生状態を取得
+                    var playbackInfo = session.GetPlaybackInfo();
+                    string status = playbackInfo.PlaybackStatus == GlobalSystemMediaTransportControlsSessionPlaybackStatus.Playing ? "1" : "0";
 
-                string romajiFull = await converter.Convert(title, To.Romaji, Mode.Spaced, RomajiSystem.Hepburn, "(", ")");
+                    // ★ ADDED: 再生時間情報を取得
+                    var timelineProps = session.GetTimelineProperties();
+                    long positionMs = (long)timelineProps.Position.TotalMilliseconds;
+                    long durationMs = (long)timelineProps.EndTime.TotalMilliseconds;
 
-                int maxLength = 50;
-                string filtered = new string(romajiFull
-                    .Where(c => c >= 0x20 && c <= 0x7E)
-                    .ToArray());
-                if (filtered.Length > maxLength)
-                    filtered = filtered.Substring(0, maxLength);
+                    // ローマ字に変換して文字をフィルタリング
+                    string romajiFull = await converter.Convert(title, To.Romaji, Mode.Spaced, RomajiSystem.Hepburn, "(", ")");
+                    int maxLength = 50;
+                    string filtered = new string(romajiFull
+                        .Where(c => c >= 0x20 && c <= 0x7E)
+                        .ToArray());
+                    if (filtered.Length > maxLength)
+                        filtered = filtered.Substring(0, maxLength);
 
-                string songInfo = $"{filtered.Replace(",", "")},{status}";
+                    // ペイロードを構築
+                    songInfoPayload = $"{filtered.Replace(",", "")},{status},{positionMs},{durationMs}";
+                }
 
-                // Send data only if it has changed
-                if (songInfo == _lastSongInfo) return;
+                if (songInfoPayload == _lastSongInfo) return;
 
                 if (_serialPort.IsOpen)
                 {
                     lock (_ackLock)
                     {
-                        // Set up the TaskCompletionSource to wait for the "OK" response
                         _songInfoAckTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
                         tcs = _songInfoAckTcs;
                     }
 
-                    _serialPort.WriteLine($"SONG_INFO:{songInfo}");
-                    Debug.WriteLine($"Sent SONG_INFO, awaiting ACK: {songInfo}");
+                    _serialPort.WriteLine($"SONG_INFO:{songInfoPayload}");
+                    Debug.WriteLine($"Sent SONG_INFO, awaiting ACK: {songInfoPayload}");
 
-                    // Wait for either the acknowledgment or a 1-second timeout
                     var timeoutTask = Task.Delay(1000);
                     var completedTask = await Task.WhenAny(tcs.Task, timeoutTask);
 
                     if (completedTask == tcs.Task && await tcs.Task)
                     {
-                        // Success: "OK" was received within the time limit
-                        _lastSongInfo = songInfo;
+                        _lastSongInfo = songInfoPayload;
                         Debug.WriteLine("SONG_INFO acknowledged successfully.");
                     }
                     else
                     {
-                        // Failure: Timed out or the task completed with a 'false' result
                         Debug.WriteLine("SONG_INFO acknowledgment timed out.");
-                        // _lastSongInfo is NOT updated
                     }
                 }
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"MediaInfo Error: {ex}");
+                // COMポートが物理的に切断された場合など(RPCサーバーを利用できません)
+                Debug.WriteLine($"MediaInfo Error: {ex.Message}");
             }
             finally
             {
-                // Ensure the TCS is cleared to allow the next operation
                 lock (_ackLock)
                 {
                     _songInfoAckTcs = null;
@@ -338,7 +349,6 @@ namespace KeymapperGui
             catch (Exception ex) { Debug.WriteLine($"DataReceived Error: {ex.Message}"); }
         }
 
-        // --- CHANGED: Updated to handle SONG_INFO acknowledgment ---
         private void HandleResponse(string resp)
         {
             if (resp == "OK")
@@ -346,19 +356,15 @@ namespace KeymapperGui
                 TaskCompletionSource<bool> tcs;
                 lock (_ackLock)
                 {
-                    // Check if we are waiting for a SONG_INFO ack
                     tcs = _songInfoAckTcs;
                 }
 
-                // If a TCS exists, complete it. This signals the waiting task.
                 if (tcs != null && tcs.TrySetResult(true))
                 {
                     Debug.WriteLine("Received ACK for SONG_INFO.");
-                    // This "OK" was for SONG_INFO, so we don't show the generic message.
                     return;
                 }
 
-                // If not waiting for SONG_INFO ack, treat it as a config write confirmation.
                 StatusTextBlock.Text = "Configuration written successfully.";
             }
             else if (resp.StartsWith("CONFIG:"))
