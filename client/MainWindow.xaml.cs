@@ -17,11 +17,14 @@ using System.Windows.Input;
 using System.Windows.Threading;
 using Windows.Media.Control;    // Media Session API
 using Kawazu;
+using System.Windows.Forms; // NotifyIconを使用するために追加
+using System.Drawing;       // ★ REMOVED: Properties.Resources経由でIcon型を直接使えるため、明示的なusingは不要な場合が多い
 
 namespace KeymapperGui
 {
     public class KeyMappingViewModel : INotifyPropertyChanged
     {
+        // ... (このクラスに変更はありません) ...
         public event PropertyChangedEventHandler PropertyChanged;
         protected void OnPropertyChanged(string propertyName) => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
 
@@ -125,6 +128,7 @@ namespace KeymapperGui
 
     public partial class MainWindow : Window
     {
+        // ... (定数やフィールドの定義に変更はありません) ...
         private const int MAX_COMBO_KEYS = 4;
         private const int NUM_TOTAL_MAPS = 13;
         private const string COMMANDS_FILE_PATH = "commands.json";
@@ -143,6 +147,9 @@ namespace KeymapperGui
         private TaskCompletionSource<bool> _songInfoAckTcs;
         private readonly object _ackLock = new object();
 
+        private NotifyIcon _notifyIcon;
+        private bool _isExplicitlyClosing = false;
+
         public ObservableCollection<KeyMappingViewModel> KeyMappings { get; set; } = new ObservableCollection<KeyMappingViewModel>();
 
         public MainWindow()
@@ -155,9 +162,69 @@ namespace KeymapperGui
 
             _serialPort.DataReceived += SerialPort_DataReceived;
             Loaded += MainWindow_Loaded;
+
+            InitializeNotifyIcon();
+
             TryAutoConnect();
         }
 
+        // ★★★ MODIFIED: アイコンの読み込み方法を .resx 対応に修正 ★★★
+        private void InitializeNotifyIcon()
+        {
+            _notifyIcon = new NotifyIcon();
+            _notifyIcon.Text = "Keymapper GUI"; // アイコンにマウスを合わせたときのツールチップ
+            _notifyIcon.Visible = true;
+
+            // .resxリソースからアイコンを直接読み込みます。
+            // これにより、pack URIを使った複雑な読み込みやtry-catchが不要になります。
+            // プロジェクト名が `KeymapperGui` の場合、リソースは `KeymapperGui.Properties.Resources` に含まれます。
+            // usingディレクティブを追加するか、完全修飾名でアクセスします。
+            byte[] iconBytes = keyboard.Properties.Resources.app_icon;
+
+            using (var ms = new MemoryStream(iconBytes))
+            {
+                _notifyIcon.Icon = new Icon(ms);
+            }
+
+            // アイコンのダブルクリックイベント
+            _notifyIcon.DoubleClick += (s, args) => ShowWindow();
+
+            // コンテキストメニューの作成
+            _notifyIcon.ContextMenuStrip = new ContextMenuStrip();
+            _notifyIcon.ContextMenuStrip.Items.Add("Show", null, (s, e) => ShowWindow());
+            _notifyIcon.ContextMenuStrip.Items.Add("Exit", null, (s, e) => ExitApplication());
+        }
+
+        private void ShowWindow()
+        {
+            this.Show();
+            this.WindowState = WindowState.Normal;
+            this.Activate();
+        }
+
+        private void ExitApplication()
+        {
+            _isExplicitlyClosing = true;
+            this.Close();
+        }
+
+        protected override void OnClosing(CancelEventArgs e)
+        {
+            if (_isExplicitlyClosing)
+            {
+                _notifyIcon.Dispose();
+                CloseSerialPort();
+                base.OnClosing(e);
+            }
+            else
+            {
+                e.Cancel = true;
+                this.Hide();
+            }
+        }
+
+
+        // ... (以降のコードには変更はありません) ...
         private void InitializeKeyMappings()
         {
             string[] labels = {
@@ -174,12 +241,11 @@ namespace KeymapperGui
         private async void MainWindow_Loaded(object sender, RoutedEventArgs e)
         {
             _mediaManager = await GlobalSystemMediaTransportControlsSessionManager.RequestAsync();
-            _mediaTimer.Interval = TimeSpan.FromMilliseconds(500); // ★ MODIFIED: ポーリング間隔を少し長くして負荷を軽減
+            _mediaTimer.Interval = TimeSpan.FromMilliseconds(500);
             _mediaTimer.Tick += async (_, __) => await CheckAndSendMediaInfo();
             _mediaTimer.Start();
         }
 
-        // ★★★ MODIFIED: この関数全体を再生時間情報取得・送信ロジックに対応 ★★★
         private async Task CheckAndSendMediaInfo()
         {
             if (_songInfoAckTcs != null) return;
@@ -193,7 +259,6 @@ namespace KeymapperGui
 
                 if (session == null)
                 {
-                    // No active media session
                     songInfoPayload = "Waiting for the beat...,0,0,0";
                 }
                 else
@@ -205,16 +270,13 @@ namespace KeymapperGui
                         title = "Waiting for the beat...";
                     }
 
-                    // 再生状態を取得
                     var playbackInfo = session.GetPlaybackInfo();
                     string status = playbackInfo.PlaybackStatus == GlobalSystemMediaTransportControlsSessionPlaybackStatus.Playing ? "1" : "0";
 
-                    // ★ ADDED: 再生時間情報を取得
                     var timelineProps = session.GetTimelineProperties();
                     long positionMs = (long)timelineProps.Position.TotalMilliseconds;
                     long durationMs = (long)timelineProps.EndTime.TotalMilliseconds;
 
-                    // ローマ字に変換して文字をフィルタリング
                     string romajiFull = await converter.Convert(title, To.Romaji, Mode.Spaced, RomajiSystem.Hepburn, "(", ")");
                     int maxLength = 50;
                     string filtered = new string(romajiFull
@@ -223,7 +285,6 @@ namespace KeymapperGui
                     if (filtered.Length > maxLength)
                         filtered = filtered.Substring(0, maxLength);
 
-                    // ペイロードを構築
                     songInfoPayload = $"{filtered.Replace(",", "")},{status},{positionMs},{durationMs}";
                 }
 
@@ -256,7 +317,6 @@ namespace KeymapperGui
             }
             catch (Exception ex)
             {
-                // COMポートが物理的に切断された場合など(RPCサーバーを利用できません)
                 Debug.WriteLine($"MediaInfo Error: {ex.Message}");
             }
             finally
@@ -273,10 +333,10 @@ namespace KeymapperGui
         private void KeyTextBox_GotFocus(object sender, RoutedEventArgs e) => _sessionKeys.Clear();
         private void KeyTextBox_LostFocus(object sender, RoutedEventArgs e) => _sessionKeys.Clear();
 
-        private void KeyTextBox_PreviewKeyDown(object sender, KeyEventArgs e)
+        private void KeyTextBox_PreviewKeyDown(object sender, System.Windows.Input.KeyEventArgs e)
         {
             e.Handled = true;
-            if (!(sender is TextBox tb) || !(tb.DataContext is KeyMappingViewModel vm) || vm.SelectedType != "Key Input")
+            if (!(sender is System.Windows.Controls.TextBox tb) || !(tb.DataContext is KeyMappingViewModel vm) || vm.SelectedType != "Key Input")
             {
                 _sessionKeys.Clear();
                 return;
@@ -382,20 +442,48 @@ namespace KeymapperGui
         {
             if (mapIndex < 0 || mapIndex >= KeyMappings.Count) return;
             var vm = KeyMappings[mapIndex];
-            if (vm.SelectedType == "Command" && !string.IsNullOrWhiteSpace(vm.CommandText))
+            var text = vm.CommandText?.Trim();
+            if (vm.SelectedType != "Command" || string.IsNullOrWhiteSpace(text))
+                return;
+
+            try
             {
-                try
+                StatusTextBlock.Text = $"Executing: {text}";
+
+                // 1) 実行ファイル名と引数を分離
+                string fileName, args;
+                var firstSpace = text.IndexOf(' ');
+                if (firstSpace < 0)
                 {
-                    StatusTextBlock.Text = $"Executing: {vm.CommandText}";
-                    Process.Start(new ProcessStartInfo(vm.CommandText) { UseShellExecute = true });
+                    fileName = text;
+                    args = "";
                 }
-                catch (Exception ex)
+                else
                 {
-                    MessageBox.Show($"Error executing '{vm.CommandText}': {ex.Message}", "Command Error", MessageBoxButton.OK, MessageBoxImage.Error);
-                    StatusTextBlock.Text = "Error executing command.";
+                    fileName = text.Substring(0, firstSpace);
+                    args = text.Substring(firstSpace + 1);
                 }
+
+                var psi = new ProcessStartInfo
+                {
+                    FileName = fileName,     // 例: "powershell" や "myapp.exe"
+                    Arguments = args,         // 例: "-NoProfile -Command \"...\""
+                    UseShellExecute = true,
+                };
+
+                Process.Start(psi);
+            }
+            catch (Exception ex)
+            {
+                System.Windows.MessageBox.Show(
+                    $"Error executing '{vm.CommandText}': {ex.Message}",
+                    "Command Error",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Error);
+                StatusTextBlock.Text = "Error executing command.";
             }
         }
+
 
         private void UpdateUIFromConfig(string data)
         {
@@ -466,7 +554,7 @@ namespace KeymapperGui
             if (_serialPort.IsOpen)
             {
                 try { _serialPort.WriteLine(command); Debug.WriteLine($"Sent: {command}"); }
-                catch (Exception ex) { MessageBox.Show($"Failed to send command: {ex.Message}", "Communication Error"); }
+                catch (Exception ex) { System.Windows.MessageBox.Show($"Failed to send command: {ex.Message}", "Communication Error"); }
             }
         }
 
@@ -482,7 +570,7 @@ namespace KeymapperGui
             }
             catch (Exception ex)
             {
-                MessageBox.Show($"Failed to save config: {ex.Message}", "File Save Error");
+                System.Windows.MessageBox.Show($"Failed to save config: {ex.Message}", "File Save Error");
             }
         }
 
@@ -500,7 +588,7 @@ namespace KeymapperGui
             }
             catch (Exception ex)
             {
-                MessageBox.Show($"Failed to load config: {ex.Message}", "File Load Error");
+                System.Windows.MessageBox.Show($"Failed to load config: {ex.Message}", "File Load Error");
             }
         }
 
@@ -549,13 +637,12 @@ namespace KeymapperGui
         private void ConnectButton_Click(object sender, RoutedEventArgs e) => Connect();
         private void DisconnectButton_Click(object sender, RoutedEventArgs e) => CloseSerialPort();
         private void RefreshButton_Click(object sender, RoutedEventArgs e) => RefreshComPorts();
-        private void Window_Closing(object sender, CancelEventArgs e) => CloseSerialPort();
 
         private void Connect()
         {
             if (ComPortComboBox.SelectedItem == null)
             {
-                MessageBox.Show("Please select a COM port.", "Error");
+                System.Windows.MessageBox.Show("Please select a COM port.", "Error");
                 return;
             }
             try
@@ -572,7 +659,7 @@ namespace KeymapperGui
             }
             catch (Exception ex)
             {
-                MessageBox.Show($"Failed to connect: {ex.Message}", "Connection Error");
+                System.Windows.MessageBox.Show($"Failed to connect: {ex.Message}", "Connection Error");
             }
         }
 
