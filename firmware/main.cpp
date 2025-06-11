@@ -6,16 +6,16 @@
 #include <string.h>
 #include <avr/io.h>
 #include <avr/interrupt.h>
+#include <stdio.h>
 
-// ★ 根本対策: U8g2をページバッファモードで初期化
-// _1_ (1KB RAM) から _2_ (256B RAM) に変更。RAMを節約し、非ブロッキング描画を可能にする。
+// U8g2をページバッファモードで初期化
 U8G2_SSD1306_128X64_NONAME_2_HW_I2C u8g2(U8G2_R0);
 
 // --- 定数定義 ---
 const uint8_t ENCODER_A_PIN = 0, ENCODER_B_PIN = 1, ENCODER_SW_PIN = A0;
 const uint8_t KEY_PINS[] = {4, 5, 6, 7, 8, 9, 10, 16};
 const uint8_t NUM_KEYS = sizeof(KEY_PINS) / sizeof(KEY_PINS[0]);
-const unsigned long DEBOUNCE_TICKS = 5; // 5ms
+const unsigned long DEBOUNCE_TICKS = 5;
 const int ENCODER_STEPS_PER_CLICK = 4;
 const int EEPROM_ADDR = 0;
 const uint16_t EEPROM_MAGIC = 0xADF1;
@@ -56,13 +56,12 @@ volatile KeyEventType keyEvents[NUM_KEYS] = {EVENT_NONE};
 volatile bool encoderSwEvent = false;
 volatile int encoderSteps = 0;
 
-// ★ 根本対策: UI更新と描画ステートマシンに関する変数を変更/追加
-bool uiNeedsUpdate = true; // UIの状態が変更されたか (アニメーション計算等)
-bool isDrawing = false;      // 現在、描画処理の実行中か (ページ分割描画のため)
+bool uiNeedsUpdate = true;
+bool isDrawing = false;
 
 // --- UIおよび曲名スクロール関連 ---
 constexpr size_t MAX_SONG_LEN = 64;
-char     currentSongName[MAX_SONG_LEN] = "No Song Info";
+char     currentSongName[MAX_SONG_LEN] = "Waiting for the beat...";
 bool     isPlaying = false;
 const int DISPLAY_WIDTH = 128;
 const int SONG_NAME_Y = 16;
@@ -71,6 +70,12 @@ const int SCROLL_PIXELS = 1;
 int      song_name_pixel_width = 0;
 int      scroll_offset_x = 0;
 unsigned long last_scroll_time = 0;
+
+// --- 音楽再生の進捗情報に関する変数 ---
+unsigned long currentPositionMs = 0;
+unsigned long totalDurationMs = 0;
+unsigned long lastInfoUpdateTimestamp = 0;
+unsigned long lastPositionAtUpdate = 0;
 
 // --- 関数のプロトタイプ宣言 ---
 void loadConfig();
@@ -86,6 +91,7 @@ void updateUiState();
 void drawScreenContent();
 void setupTimerInterrupt();
 int getFreeRam();
+void formatTime(char* buffer, size_t bufferSize, unsigned long totalMilliseconds);
 
 // --- 割り込みサービスルーチン (エンコーダー回転) ---
 void handleEncoderISR() {
@@ -107,7 +113,7 @@ ISR(TIMER1_COMPA_vect) {
 // --- セットアップ ---
 void setup() {
     Serial.begin(115200);
-    Wire.setClock(400000L); // I2C高速化は維持
+    Wire.setClock(400000L);
     u8g2.begin();
     u8g2.enableUTF8Print();
     Keyboard.begin();
@@ -120,9 +126,8 @@ void setup() {
     pinMode(ENCODER_A_PIN, INPUT_PULLUP);
     pinMode(ENCODER_B_PIN, INPUT_PULLUP);
     
-    delay(2); // ピンモード設定の安定化
+    delay(2);
     
-    // エンコーダー割り込み設定
     encoderState = (digitalRead(ENCODER_A_PIN) << 1) | digitalRead(ENCODER_B_PIN);
     attachInterrupt(digitalPinToInterrupt(ENCODER_A_PIN), handleEncoderISR, CHANGE);
     attachInterrupt(digitalPinToInterrupt(ENCODER_B_PIN), handleEncoderISR, CHANGE);
@@ -130,42 +135,35 @@ void setup() {
     u8g2.setFont(u8g2_font_6x10_tf);
     song_name_pixel_width = u8g2.getStrWidth(currentSongName);
     
-    setupTimerInterrupt(); // 1msタイマー割り込みを開始
+    setupTimerInterrupt();
 
-    uiNeedsUpdate = true; // 起動時に初回描画を要求
+    uiNeedsUpdate = true;
 }
 
-// ★ 根本対策: loop関数をステートマシン構造に変更
+// --- メインループ ---
 void loop() {
-    // 1. 常に実行する処理 (キー入力、シリアル)
     handleSerialCommands();
     processEvents();
-
-    // 2. UIの状態を更新 (アニメーション位置計算など)
     updateUiState();
 
-    // 3. 描画ステートマシン
-    //    描画処理を1ページずつ分割して実行し、loopのブロッキングを防ぐ
     if (!isDrawing && uiNeedsUpdate) {
-        // 描画が必要で、現在描画中でなければ、描画を開始する
         u8g2.firstPage();
         isDrawing = true;
         uiNeedsUpdate = false;
     }
 
     if (isDrawing) {
-        // 描画中であれば、現在のページの内容を描画する
         drawScreenContent();
-        // 次のページに進む。u8g2.nextPage()がfalseを返したら全ページ描画完了
         if (!u8g2.nextPage()) {
-            isDrawing = false; // 描画完了
+            isDrawing = false;
         }
     }
 }
 
-// ★ 根本対策: UIの状態更新ロジックを分離
+// UIの状態更新ロジック
 void updateUiState() {
-    // スクロールアニメーションの位置計算
+    bool needsRedraw = false;
+
     if (song_name_pixel_width > DISPLAY_WIDTH) {
         unsigned long current_time = millis();
         if (current_time - last_scroll_time > SCROLL_INTERVAL) {
@@ -176,22 +174,44 @@ void updateUiState() {
             if (scroll_offset_x <= (-song_name_pixel_width - gap)) {
                 scroll_offset_x += (song_name_pixel_width + gap);
             }
-            uiNeedsUpdate = true; // UIの状態が変化したので、再描画を要求
+            needsRedraw = true;
         }
+    }
+
+    if (isPlaying && totalDurationMs > 0) {
+        currentPositionMs = lastPositionAtUpdate + (millis() - lastInfoUpdateTimestamp);
+        if (currentPositionMs > totalDurationMs) {
+            currentPositionMs = totalDurationMs;
+        }
+        needsRedraw = true;
+    }
+    
+    if(needsRedraw){
+        uiNeedsUpdate = true;
     }
 }
 
-// ★ 根本対策: 画面の描画内容を定義する関数
-// この関数はページバッファモードのループの中から毎回呼ばれる
+// ミリ秒を MM:SS 形式の文字列に変換するヘルパー関数
+void formatTime(char* buffer, size_t bufferSize, unsigned long totalMilliseconds) {
+    if (bufferSize < 6) return;
+
+    unsigned long totalSeconds = totalMilliseconds / 1000;
+    int minutes = totalSeconds / 60;
+    int seconds = totalSeconds % 60;
+
+    snprintf(buffer, bufferSize, "%d:%02d", minutes, seconds);
+}
+
+
+// 画面の描画内容を定義する関数
 void drawScreenContent() {
     constexpr int W = 128;
     constexpr int H = 64;
-    constexpr int iconW = 16;
-    constexpr int spacing = 24;
-
+    
     u8g2.setFont(u8g2_font_6x10_tf);
     
-    // 曲名表示
+    // --- 1. 曲名表示 (Y=16) ---
+    u8g2.setFontPosBaseline();
     if (song_name_pixel_width > W) {
         constexpr int gap = 40;
         u8g2.drawStr(scroll_offset_x, SONG_NAME_Y, currentSongName);
@@ -200,35 +220,76 @@ void drawScreenContent() {
         int16_t tw = song_name_pixel_width;
         u8g2.drawStr((W - tw) / 2, SONG_NAME_Y, currentSongName);
     }
+    
+    // --- 区切り線 ---
+    // const int separatorY = 26; // ★ MODIFIED: Y座標を2px下に
+    // u8g2.drawHLine(0, separatorY, W);
 
-    // 操作アイコン表示
-    const int cy      = 48;
+
+    // --- 2. プログレスバーと時間表示 (Y=40) ---
+    if (totalDurationMs > 0) {
+        const int progressAreaY = 40; // ★ MODIFIED: Y座標を2px下に
+        const int barH = 4;
+        const int textMargin = 5;
+
+        u8g2.setFontPosCenter();
+        
+        char timeStr[6];
+        char durationStr[6];
+        
+        formatTime(timeStr, sizeof(timeStr), currentPositionMs);
+        formatTime(durationStr, sizeof(durationStr), totalDurationMs);
+
+        int timeStrW = u8g2.getStrWidth(timeStr);
+        int durationStrW = u8g2.getStrWidth(durationStr);
+
+        u8g2.drawStr(0, progressAreaY, timeStr);
+        u8g2.drawStr(W - durationStrW, progressAreaY, durationStr);
+
+        int barX = timeStrW + textMargin;
+        int barMaxW = W - timeStrW - durationStrW - (textMargin * 2);
+        int barY = progressAreaY - (barH / 2);
+
+        uint16_t progressW = (uint16_t)((float)currentPositionMs / totalDurationMs * barMaxW);
+        
+        if (barMaxW > 0) {
+            u8g2.drawFrame(barX, barY, barMaxW, barH);
+            u8g2.drawBox(barX, barY, progressW, barH);
+        }
+    }
+
+    // --- 3. 操作アイコン表示 (Y=57) ---
+    u8g2.setFontPosBaseline();
+    constexpr int iconW = 14;
+    constexpr int spacing = 22;
+    const int cy      = 57; // このY座標は維持
     const int cx_play = W / 2;
     const int cx_prev = cx_play - (iconW + spacing);
     const int cx_next = cx_play + (iconW + spacing);
 
     { // Previous
-        int barW = 2, barH = 14;
+        int barW = 2, barH = 10;
         u8g2.drawBox(cx_prev + iconW / 2 - barW, cy - barH / 2, barW, barH);
         u8g2.drawTriangle(cx_prev - iconW / 2 + 2, cy, cx_prev + iconW / 2 - barW - 2, cy - barH / 2, cx_prev + iconW / 2 - barW - 2, cy + barH / 2);
     }
     { // Play/Pause
-        int barW = 3, barH = 16;
+        int barW = 3, barH = 12;
         if (isPlaying) {
-            u8g2.drawBox(cx_play - barW - 1, cy - barH / 2, barW, barH);
-            u8g2.drawBox(cx_play + 1, cy - barH / 2, barW, barH);
+            u8g2.drawBox(cx_play - barW, cy - barH / 2, barW, barH);
+            u8g2.drawBox(cx_play + 2, cy - barH / 2, barW, barH);
         } else {
-            u8g2.drawTriangle(cx_play - iconW / 2 + 1, cy - barH / 2, cx_play - iconW / 2 + 1, cy + barH / 2, cx_play + iconW / 2 - 1, cy);
+            u8g2.drawTriangle(cx_play - iconW / 2 + 2, cy - barH / 2, cx_play - iconW / 2 + 2, cy + barH / 2, cx_play + iconW / 2 - 2, cy);
         }
     }
     { // Next
-        int barW = 2, barH = 14;
+        int barW = 2, barH = 10;
         u8g2.drawTriangle(cx_next + iconW / 2 - 2, cy, cx_next - iconW / 2 + barW + 2, cy - barH / 2, cx_next - iconW / 2 + barW + 2, cy + barH / 2);
         u8g2.drawBox(cx_next - iconW / 2, cy - barH / 2, barW, barH);
     }
 }
 
-// --- 以下の関数群は、アーキテクチャ変更による影響を受けないため、元のコードのままです ---
+
+// --- 以下の関数群は変更ありません ---
 
 void setupTimerInterrupt() {
     cli();
@@ -414,13 +475,24 @@ void handleSerialCommands() {
             Serial.println();
         } else if (strncmp(command, "SONG_INFO:", 10) == 0) {
             char* data = command + 10;
-            char* p = strtok(data, ",");
-            if (p != nullptr) {
-                strncpy(currentSongName, p, MAX_SONG_LEN - 1);
+            
+            char* p_title = strtok(data, ",");
+            if (p_title != nullptr) {
+                strncpy(currentSongName, p_title, MAX_SONG_LEN - 1);
                 currentSongName[MAX_SONG_LEN - 1] = '\0';
-                p = strtok(nullptr, ",");
-                if (p != nullptr) { isPlaying = (atoi(p) != 0); }
                 
+                char* p_status = strtok(nullptr, ",");
+                if (p_status != nullptr) { isPlaying = (atoi(p_status) != 0); }
+
+                char* p_pos = strtok(nullptr, ",");
+                if (p_pos != nullptr) { lastPositionAtUpdate = atol(p_pos); } else { lastPositionAtUpdate = 0; }
+
+                char* p_dur = strtok(nullptr, ",");
+                if (p_dur != nullptr) { totalDurationMs = atol(p_dur); } else { totalDurationMs = 0; }
+
+                lastInfoUpdateTimestamp = millis();
+                currentPositionMs = lastPositionAtUpdate;
+
                 u8g2.setFont(u8g2_font_6x10_tf);
                 song_name_pixel_width = u8g2.getStrWidth(currentSongName);
                 
