@@ -5,10 +5,13 @@
 #include <EEPROM.h>
 #include <string.h>
 #include <avr/io.h>
-#include <avr/interrupt.h> // ★ 割り込みのために追加
+#include <avr/interrupt.h>
+
+// ★ 根本対策: U8g2をページバッファモードで初期化
+// _1_ (1KB RAM) から _2_ (256B RAM) に変更。RAMを節約し、非ブロッキング描画を可能にする。
+U8G2_SSD1306_128X64_NONAME_2_HW_I2C u8g2(U8G2_R0);
 
 // --- 定数定義 ---
-U8G2_SSD1306_128X64_NONAME_1_HW_I2C u8g2(U8G2_R0);
 const uint8_t ENCODER_A_PIN = 0, ENCODER_B_PIN = 1, ENCODER_SW_PIN = A0;
 const uint8_t KEY_PINS[] = {4, 5, 6, 7, 8, 9, 10, 16};
 const uint8_t NUM_KEYS = sizeof(KEY_PINS) / sizeof(KEY_PINS[0]);
@@ -35,7 +38,6 @@ struct KeyMapping {
 KeyMapping keyMap[NUM_TOTAL_MAPS];
 
 // --- グローバル変数 ---
-// ★★★ 割り込みとメインループで共有する変数は volatile にする ★★★
 volatile bool currentKeyStates[NUM_KEYS] = {false};
 bool lastKeyStates[NUM_KEYS] = {false};
 volatile uint8_t debounceCounters[NUM_KEYS] = {0};
@@ -49,13 +51,14 @@ volatile uint8_t encoderState = 0;
 long lastProcessedEncoderCount = 0;
 volatile long encoderCountAtSwPress = 0;
 
-// ★★★ イベント処理のための変数 ★★★
 enum KeyEventType : uint8_t { EVENT_NONE, EVENT_PRESS, EVENT_RELEASE };
 volatile KeyEventType keyEvents[NUM_KEYS] = {EVENT_NONE};
 volatile bool encoderSwEvent = false;
 volatile int encoderSteps = 0;
-volatile bool uiNeedsUpdate = true; // UI更新フラグ
 
+// ★ 根本対策: UI更新と描画ステートマシンに関する変数を変更/追加
+bool uiNeedsUpdate = true; // UIの状態が変更されたか (アニメーション計算等)
+bool isDrawing = false;      // 現在、描画処理の実行中か (ページ分割描画のため)
 
 // --- UIおよび曲名スクロール関連 ---
 constexpr size_t MAX_SONG_LEN = 64;
@@ -63,10 +66,11 @@ char     currentSongName[MAX_SONG_LEN] = "No Song Info";
 bool     isPlaying = false;
 const int DISPLAY_WIDTH = 128;
 const int SONG_NAME_Y = 16;
+const unsigned long SCROLL_INTERVAL = 33;
+const int SCROLL_PIXELS = 1;
 int      song_name_pixel_width = 0;
 int      scroll_offset_x = 0;
 unsigned long last_scroll_time = 0;
-const unsigned long SCROLL_INTERVAL = 30;
 
 // --- 関数のプロトタイプ宣言 ---
 void loadConfig();
@@ -74,13 +78,13 @@ void saveConfig();
 void handleEncoderISR();
 void setup();
 void loop();
-void processEvents(); // ★ 追加：イベント処理関数
-void scanKeysAndEncoder(); // ★ 追加：タイマーで動かすスキャン関数
+void processEvents();
+void scanKeysAndEncoder();
 void handleSerialCommands();
 void executeMapping(int mapIndex, bool pressed);
-void drawUI();
-void updateUI(); // ★ 追加：UI更新管理関数
-void setupTimerInterrupt(); // ★ 追加：タイマー設定関数
+void updateUiState();
+void drawScreenContent();
+void setupTimerInterrupt();
 int getFreeRam();
 
 // --- 割り込みサービスルーチン (エンコーダー回転) ---
@@ -103,7 +107,7 @@ ISR(TIMER1_COMPA_vect) {
 // --- セットアップ ---
 void setup() {
     Serial.begin(115200);
-    Wire.setClock(100000L); 
+    Wire.setClock(400000L); // I2C高速化は維持
     u8g2.begin();
     u8g2.enableUTF8Print();
     Keyboard.begin();
@@ -126,46 +130,119 @@ void setup() {
     u8g2.setFont(u8g2_font_6x10_tf);
     song_name_pixel_width = u8g2.getStrWidth(currentSongName);
     
-    setupTimerInterrupt(); // ★ 1msタイマー割り込みを開始
+    setupTimerInterrupt(); // 1msタイマー割り込みを開始
 
     uiNeedsUpdate = true; // 起動時に初回描画を要求
 }
 
-// --- メインループ ---
+// ★ 根本対策: loop関数をステートマシン構造に変更
 void loop() {
+    // 1. 常に実行する処理 (キー入力、シリアル)
     handleSerialCommands();
-    processEvents(); // ★ イベントを処理する
-    updateUI();      // ★ UIの更新を管理する
+    processEvents();
+
+    // 2. UIの状態を更新 (アニメーション位置計算など)
+    updateUiState();
+
+    // 3. 描画ステートマシン
+    //    描画処理を1ページずつ分割して実行し、loopのブロッキングを防ぐ
+    if (!isDrawing && uiNeedsUpdate) {
+        // 描画が必要で、現在描画中でなければ、描画を開始する
+        u8g2.firstPage();
+        isDrawing = true;
+        uiNeedsUpdate = false;
+    }
+
+    if (isDrawing) {
+        // 描画中であれば、現在のページの内容を描画する
+        drawScreenContent();
+        // 次のページに進む。u8g2.nextPage()がfalseを返したら全ページ描画完了
+        if (!u8g2.nextPage()) {
+            isDrawing = false; // 描画完了
+        }
+    }
 }
 
+// ★ 根本対策: UIの状態更新ロジックを分離
+void updateUiState() {
+    // スクロールアニメーションの位置計算
+    if (song_name_pixel_width > DISPLAY_WIDTH) {
+        unsigned long current_time = millis();
+        if (current_time - last_scroll_time > SCROLL_INTERVAL) {
+            last_scroll_time = current_time;
+            scroll_offset_x -= SCROLL_PIXELS;
+            
+            constexpr int gap = 40;
+            if (scroll_offset_x <= (-song_name_pixel_width - gap)) {
+                scroll_offset_x += (song_name_pixel_width + gap);
+            }
+            uiNeedsUpdate = true; // UIの状態が変化したので、再描画を要求
+        }
+    }
+}
 
-// ★★★ ここからが修正の核となる部分 ★★★
+// ★ 根本対策: 画面の描画内容を定義する関数
+// この関数はページバッファモードのループの中から毎回呼ばれる
+void drawScreenContent() {
+    constexpr int W = 128;
+    constexpr int H = 64;
+    constexpr int iconW = 16;
+    constexpr int spacing = 24;
 
-/**
- * @brief 1ms周期のタイマー割り込みを設定する
- */
+    u8g2.setFont(u8g2_font_6x10_tf);
+    
+    // 曲名表示
+    if (song_name_pixel_width > W) {
+        constexpr int gap = 40;
+        u8g2.drawStr(scroll_offset_x, SONG_NAME_Y, currentSongName);
+        u8g2.drawStr(scroll_offset_x + song_name_pixel_width + gap, SONG_NAME_Y, currentSongName);
+    } else {
+        int16_t tw = song_name_pixel_width;
+        u8g2.drawStr((W - tw) / 2, SONG_NAME_Y, currentSongName);
+    }
+
+    // 操作アイコン表示
+    const int cy      = 48;
+    const int cx_play = W / 2;
+    const int cx_prev = cx_play - (iconW + spacing);
+    const int cx_next = cx_play + (iconW + spacing);
+
+    { // Previous
+        int barW = 2, barH = 14;
+        u8g2.drawBox(cx_prev + iconW / 2 - barW, cy - barH / 2, barW, barH);
+        u8g2.drawTriangle(cx_prev - iconW / 2 + 2, cy, cx_prev + iconW / 2 - barW - 2, cy - barH / 2, cx_prev + iconW / 2 - barW - 2, cy + barH / 2);
+    }
+    { // Play/Pause
+        int barW = 3, barH = 16;
+        if (isPlaying) {
+            u8g2.drawBox(cx_play - barW - 1, cy - barH / 2, barW, barH);
+            u8g2.drawBox(cx_play + 1, cy - barH / 2, barW, barH);
+        } else {
+            u8g2.drawTriangle(cx_play - iconW / 2 + 1, cy - barH / 2, cx_play - iconW / 2 + 1, cy + barH / 2, cx_play + iconW / 2 - 1, cy);
+        }
+    }
+    { // Next
+        int barW = 2, barH = 14;
+        u8g2.drawTriangle(cx_next + iconW / 2 - 2, cy, cx_next - iconW / 2 + barW + 2, cy - barH / 2, cx_next - iconW / 2 + barW + 2, cy + barH / 2);
+        u8g2.drawBox(cx_next - iconW / 2, cy - barH / 2, barW, barH);
+    }
+}
+
+// --- 以下の関数群は、アーキテクチャ変更による影響を受けないため、元のコードのままです ---
+
 void setupTimerInterrupt() {
-    cli(); // 全ての割り込みを無効化
-    // Timer1 を CTC モードに設定
+    cli();
     TCCR1A = 0;
     TCCR1B = 0;
     TCNT1  = 0;
-
-    // 1ms周期に設定 (16MHz / 64プリスケーラ / 250カウント = 1000Hz)
     OCR1A = 249;
-    TCCR1B |= (1 << WGM12); // CTCモード
-    TCCR1B |= (1 << CS11) | (1 << CS10); // 64プリスケーラ
-    TIMSK1 |= (1 << OCIE1A); // タイマー比較A割り込みを有効化
-    sei(); // 全ての割り込みを有効化
+    TCCR1B |= (1 << WGM12);
+    TCCR1B |= (1 << CS11) | (1 << CS10);
+    TIMSK1 |= (1 << OCIE1A);
+    sei();
 }
 
-
-/**
- * @brief タイマー割り込みで呼び出され、キーとエンコーダーの状態をスキャンする
- * @note この関数はISRから呼ばれるため、処理は最小限に留める
- */
 void scanKeysAndEncoder() {
-    // --- キーのスキャン ---
     for (int i = 0; i < NUM_KEYS; i++) {
         bool reading = (digitalRead(KEY_PINS[i]) == LOW);
         if (reading != lastKeyStates[i]) {
@@ -173,7 +250,6 @@ void scanKeysAndEncoder() {
             if (debounceCounters[i] >= DEBOUNCE_TICKS) {
                 lastKeyStates[i] = reading;
                 currentKeyStates[i] = reading;
-                // イベントをセット (メインループで処理される)
                 keyEvents[i] = reading ? EVENT_PRESS : EVENT_RELEASE;
                 debounceCounters[i] = 0;
             }
@@ -182,7 +258,6 @@ void scanKeysAndEncoder() {
         }
     }
 
-    // --- エンコーダースイッチのスキャン ---
     bool swReading = (digitalRead(ENCODER_SW_PIN) == LOW);
     if (swReading != lastEncoderSwState) {
         encoderSwDebounceCounter++;
@@ -190,18 +265,17 @@ void scanKeysAndEncoder() {
             lastEncoderSwState = swReading;
             bool oldState = currentEncoderSwState;
             currentEncoderSwState = swReading;
-
             if (oldState != currentEncoderSwState) {
-                if (currentEncoderSwState) { // 押された瞬間
+                if (currentEncoderSwState) {
                     noInterrupts();
                     encoderCountAtSwPress = encoderCount;
                     interrupts();
-                } else { // 離された瞬間
+                } else {
                     noInterrupts();
                     long cntNow = encoderCount;
                     interrupts();
                     if (cntNow == encoderCountAtSwPress) {
-                        encoderSwEvent = true; // クリックイベントをセット
+                        encoderSwEvent = true;
                     }
                 }
             }
@@ -212,12 +286,7 @@ void scanKeysAndEncoder() {
     }
 }
 
-
-/**
- * @brief メインループで実行され、発生したイベントを処理する
- */
 void processEvents() {
-    // --- キーイベントの処理 ---
     for (int i = 0; i < NUM_KEYS; i++) {
         noInterrupts();
         KeyEventType event = keyEvents[i];
@@ -231,14 +300,12 @@ void processEvents() {
         }
     }
 
-    // --- エンコーダースイッチイベントの処理 ---
     if (encoderSwEvent) {
         executeMapping(ENCODER_SW_INDEX, true);
         executeMapping(ENCODER_SW_INDEX, false);
         encoderSwEvent = false;
     }
 
-    // --- エンコーダー回転イベントの処理 ---
     noInterrupts();
     long c = encoderCount;
     interrupts();
@@ -258,86 +325,6 @@ void processEvents() {
         lastProcessedEncoderCount -= steps * ENCODER_STEPS_PER_CLICK;
     }
 }
-
-/**
- * @brief UIの更新を管理する。画面の変更が必要な時だけ描画する
- */
-void updateUI() {
-    // スクロール処理
-    if (song_name_pixel_width > DISPLAY_WIDTH) {
-        unsigned long current_time = millis();
-        if (current_time - last_scroll_time > SCROLL_INTERVAL) {
-            last_scroll_time = current_time;
-            scroll_offset_x -= 2;
-
-            constexpr int gap = 40;
-            if (scroll_offset_x <= (-song_name_pixel_width - gap)) {
-                scroll_offset_x += (song_name_pixel_width + gap);
-            }
-            uiNeedsUpdate = true; // スクロールしたのでUI更新を要求
-        }
-    }
-    
-    // UI更新フラグが立っていたら描画
-    if (uiNeedsUpdate) {
-        drawUI();
-        uiNeedsUpdate = false; // フラグをクリア
-    }
-}
-
-/**
- * @brief OLEDにUIを描画する
- */
-void drawUI() {
-    constexpr int W = 128;
-    constexpr int H = 64;
-    constexpr int iconW = 16;
-    constexpr int spacing = 24;
-
-    u8g2.firstPage();
-    do {
-        u8g2.setFont(u8g2_font_6x10_tf);
-        
-        // 曲名表示
-        if (song_name_pixel_width > W) {
-            constexpr int gap = 40;
-            u8g2.drawStr(scroll_offset_x, SONG_NAME_Y, currentSongName);
-            u8g2.drawStr(scroll_offset_x + song_name_pixel_width + gap, SONG_NAME_Y, currentSongName);
-        } else {
-            int16_t tw = song_name_pixel_width;
-            u8g2.drawStr((W - tw) / 2, SONG_NAME_Y, currentSongName);
-        }
-
-        // 操作アイコン表示
-        const int cy      = 48;
-        const int cx_play = W / 2;
-        const int cx_prev = cx_play - (iconW + spacing);
-        const int cx_next = cx_play + (iconW + spacing);
-
-        { // Previous
-            int barW = 2, barH = 14;
-            u8g2.drawBox(cx_prev + iconW / 2 - barW, cy - barH / 2, barW, barH);
-            u8g2.drawTriangle(cx_prev - iconW / 2 + 2, cy, cx_prev + iconW / 2 - barW - 2, cy - barH / 2, cx_prev + iconW / 2 - barW - 2, cy + barH / 2);
-        }
-        { // Play/Pause
-            int barW = 3, barH = 16;
-            if (isPlaying) {
-                u8g2.drawBox(cx_play - barW - 1, cy - barH / 2, barW, barH);
-                u8g2.drawBox(cx_play + 1, cy - barH / 2, barW, barH);
-            } else {
-                u8g2.drawTriangle(cx_play - iconW / 2 + 1, cy - barH / 2, cx_play - iconW / 2 + 1, cy + barH / 2, cx_play + iconW / 2 - 1, cy);
-            }
-        }
-        { // Next
-            int barW = 2, barH = 14;
-            u8g2.drawTriangle(cx_next + iconW / 2 - 2, cy, cx_next - iconW / 2 + barW + 2, cy - barH / 2, cx_next - iconW / 2 + barW + 2, cy + barH / 2);
-            u8g2.drawBox(cx_next - iconW / 2, cy - barH / 2, barW, barH);
-        }
-    } while (u8g2.nextPage());
-}
-
-
-// --- 以下の関数は元のロジックからほぼ変更ありません ---
 
 void executeMapping(int mapIndex, bool pressed) {
     KeyMapping mapping = keyMap[mapIndex];
@@ -441,7 +428,7 @@ void handleSerialCommands() {
                     scroll_offset_x = 0;
                 }
                 
-                uiNeedsUpdate = true; // UIが変更されたので更新を要求
+                uiNeedsUpdate = true;
             }
             Serial.println("OK");
         } else {
