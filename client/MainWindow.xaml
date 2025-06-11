@@ -1,4 +1,4 @@
-﻿<Window x:Class="KeymapperGui.MainWindow"
+<Window x:Class="KeymapperGui.MainWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
@@ -6,7 +6,7 @@
         xmlns:local="clr-namespace:KeymapperGui"
         mc:Ignorable="d"
         Title="Arduino HID Key Mapper (Commander Mode)" Height="700" Width="750"
-        Closing="Window_Closing">
+        >
 
     <Window.Resources>
         <BooleanToVisibilityConverter x:Key="BoolToVis"/>
